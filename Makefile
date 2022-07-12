@@ -44,6 +44,8 @@ GITHUB_ORG ?= redhat-appstudio-appdata
 DEVFILE_REGISTRY_URL ?= https://registry.devfile.io
 ENABLE_WEBHOOKS ?= true
 
+GITOPS_SHARED_CRD = https://raw.githubusercontent.com/redhat-appstudio/managed-gitops/main/appstudio-shared/manifests/appstudio-shared-customresourcedefinitions.yaml
+
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
 CRD_OPTIONS ?= "crd:trivialVersions=true,preserveUnknownFields=false"
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
@@ -84,6 +86,10 @@ help: ## Display this help.
 
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(MAKE) manifests-kcp
+
+manifests-kcp:	## Generate KCP APIResourceSchema from CRDs
+	hack/generate-kcp-api.sh
 
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
@@ -158,6 +164,7 @@ install-kcp: manifests kustomize
 
 install: manifests kustomize #install-cert ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | kubectl apply -f -
+	kubectl apply -f $(GITOPS_SHARED_CRD)
 
 uninstall: manifests kustomize #uninstall-cert ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/crd | kubectl delete -f -
@@ -169,6 +176,12 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: ## Undeploy controller from the K8s cluster specified in ~/.kube/config.
 	$(KUSTOMIZE) build config/default | kubectl delete -f -
 
+deploy-kcp: manifests install ## Install CRDs and deploy HAS on KCP
+	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
+	GITHUB_ORG=${GITHUB_ORG} DEVFILE_REGISTRY_URL=${DEVFILE_REGISTRY_URL} $(KUSTOMIZE) build config/kcp | kubectl apply -f -
+
+undeploy-kcp: # Undeploy HAS from KCP (including CRDs)
+	$(KUSTOMIZE) build config/kcp | kubectl delete -f -
 
 CONTROLLER_GEN = $(shell pwd)/bin/controller-gen
 controller-gen: ## Download controller-gen locally if necessary.
@@ -265,8 +278,8 @@ apply-crds:
 	kubectl apply \
 	-f $(APPLICATIONS_CRD) \
 	-f $(COMPONENT_DETECTION_QUERIES_CRD) \
-	-f $(COMPONENT_CRD)
-
+	-f $(COMPONENT_CRD) \
+	-f $(GITOPS_SHARED_CRD)
 .PHONY: debug
 debug: dlv generate manifests kustomize apply-crds
 	$(MAKE) debug-stop; \

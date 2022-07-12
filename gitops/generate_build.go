@@ -18,12 +18,14 @@ package gitops
 
 import (
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 	"time"
 
 	devfilev1alpha2 "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	devfilecommon "github.com/devfile/library/pkg/devfile/parser/data/v2/common"
+	pacv1aplha1 "github.com/openshift-pipelines/pipelines-as-code/pkg/apis/pipelinesascode/v1alpha1"
 	routev1 "github.com/openshift/api/route/v1"
 	appstudiov1alpha1 "github.com/redhat-appstudio/application-service/api/v1alpha1"
 	"github.com/redhat-appstudio/application-service/gitops/prepare"
@@ -45,22 +47,48 @@ const (
 	buildTriggerTemplateFileName  = "trigger-template.yaml"
 	buildEventListenerFileName    = "event-listener.yaml"
 	buildWebhookRouteFileName     = "build-webhook-route.yaml"
+	buildRepositoryFileName       = "pac-repository.yaml"
+
+	DefaultImageRepo = "quay.io/redhat-appstudio/user-workload"
+	PaCAnnotation    = "pipelinesascode"
 )
+
+var (
+	imageRegistry = DefaultImageRepo
+)
+
+func GetDefaultImageRepo() string {
+	return imageRegistry
+}
+
+func SetDefaultImageRepo(repo string) {
+	imageRegistry = repo
+}
 
 func GenerateBuild(fs afero.Fs, outputFolder string, component appstudiov1alpha1.Component, gitopsConfig prepare.GitopsConfig) error {
 	//commonStoragePVC := GenerateCommonStorage(component, "appstudio")
-	triggerTemplate, err := GenerateTriggerTemplate(component, gitopsConfig)
-	if err != nil {
-		return err
-	}
-	eventListener := GenerateEventListener(component, *triggerTemplate)
-	webhookRoute := GenerateBuildWebhookRoute(component)
+	var buildResources map[string]interface{}
+	var err error
+	val, ok := component.Annotations[PaCAnnotation]
+	if ok && val == "1" {
+		repository := GeneratePACRepository(component)
+		buildResources = map[string]interface{}{
+			buildRepositoryFileName: repository,
+		}
+	} else {
+		triggerTemplate, err := GenerateTriggerTemplate(component, gitopsConfig)
+		if err != nil {
+			return err
+		}
+		eventListener := GenerateEventListener(component, *triggerTemplate)
+		webhookRoute := GenerateBuildWebhookRoute(component)
 
-	buildResources := map[string]interface{}{
-		//buildCommonStoragePVCFileName: commonStoragePVC,
-		buildTriggerTemplateFileName: triggerTemplate,
-		buildEventListenerFileName:   eventListener,
-		buildWebhookRouteFileName:    webhookRoute,
+		buildResources = map[string]interface{}{
+			//buildCommonStoragePVCFileName: commonStoragePVC,
+			buildTriggerTemplateFileName: triggerTemplate,
+			buildEventListenerFileName:   eventListener,
+			buildWebhookRouteFileName:    webhookRoute,
+		}
 	}
 
 	kustomize := resources.Kustomization{}
@@ -78,8 +106,13 @@ func GenerateBuild(fs afero.Fs, outputFolder string, component appstudiov1alpha1
 }
 
 // GenerateInitialBuildPipelineRun generates pipeline run for initial build of the component.
-func GenerateInitialBuildPipelineRun(component appstudiov1alpha1.Component, gitopsConfig prepare.GitopsConfig) tektonapi.PipelineRun {
-	initialBuildSpec := DetermineBuildExecution(component, getParamsForComponentBuild(component, true), getInitialBuildWorkspaceSubpath(), gitopsConfig)
+func GenerateInitialBuildPipelineRun(component appstudiov1alpha1.Component, gitopsConfig prepare.GitopsConfig) (tektonapi.PipelineRun, error) {
+	// normalizeOutputImageURL is not called with initial builds so we can ignore the error here
+	params, err := getParamsForComponentBuild(component, true)
+	if err != nil {
+		return tektonapi.PipelineRun{}, err
+	}
+	initialBuildSpec := DetermineBuildExecution(component, params, getInitialBuildWorkspaceSubpath(), gitopsConfig)
 
 	return tektonapi.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
@@ -88,7 +121,7 @@ func GenerateInitialBuildPipelineRun(component appstudiov1alpha1.Component, gito
 			Labels:       getBuildCommonLabelsForComponent(&component),
 		},
 		Spec: initialBuildSpec,
-	}
+	}, nil
 }
 
 func getInitialBuildWorkspaceSubpath() string {
@@ -174,6 +207,17 @@ func determineBuildPipeline(component appstudiov1alpha1.Component) string {
 	return "noop"
 }
 
+func protectDefaultImageRepo(outputImage, namespace string) error {
+	// do not allow use of the default registry and a different user's tag
+	if strings.HasPrefix(outputImage, GetDefaultImageRepo()) {
+		if !strings.HasPrefix(outputImage, GetDefaultImageRepo()+":"+namespace+"-") || !strings.Contains(outputImage, ":") {
+			return fmt.Errorf("invalid user image tag combination of default repo %s and component namespace %s", outputImage, namespace)
+		}
+	}
+
+	return nil
+}
+
 func normalizeOutputImageURL(outputImage string) string {
 	// Check if the image has commit SHA suffix and delete it if so
 	shaSuffixRegExp := regexp.MustCompile(`(.+)-[0-9a-f]{40}$`)
@@ -201,9 +245,16 @@ func normalizeOutputImageURL(outputImage string) string {
 // that would build an image from source of the Component.
 // The key difference between webhook (regular) triggered PipelineRuns and user-triggered (initial) PipelineRuns
 // is that the git revision appended to the output image tag in case of webhook build.
-func getParamsForComponentBuild(component appstudiov1alpha1.Component, isInitialBuild bool) []tektonapi.Param {
+func getParamsForComponentBuild(component appstudiov1alpha1.Component, isInitialBuild bool) ([]tektonapi.Param, error) {
 	sourceCode := component.Spec.Source.GitSource.URL
+	revision := component.Spec.Source.GitSource.Revision
 	outputImage := component.Spec.ContainerImage
+	var err error
+
+	if err = protectDefaultImageRepo(outputImage, component.Namespace); err != nil {
+		return []tektonapi.Param{}, err
+	}
+
 	if !isInitialBuild {
 		outputImage = normalizeOutputImageURL(component.Spec.ContainerImage)
 	}
@@ -225,7 +276,17 @@ func getParamsForComponentBuild(component appstudiov1alpha1.Component, isInitial
 			},
 		},
 	}
-
+	// if revision is specified in the component
+	// use it in the parms to the Pipeline Run
+	if revision != "" {
+		params = append(params, tektonapi.Param{
+			Name: "revision",
+			Value: tektonapi.ArrayOrString{
+				Type:      tektonapi.ParamTypeString,
+				StringVal: revision,
+			},
+		})
+	}
 	// Analyze component model for additional parameters
 	if componentDevfileData, err := devfile.ParseDevfileModel(component.Status.Devfile); err == nil {
 
@@ -261,7 +322,7 @@ func getParamsForComponentBuild(component appstudiov1alpha1.Component, isInitial
 
 	}
 
-	return params
+	return params, err
 }
 
 func getBuildCommonLabelsForComponent(component *appstudiov1alpha1.Component) map[string]string {
@@ -297,7 +358,7 @@ func GenerateCommonStorage(component appstudiov1alpha1.Component, name string) *
 			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
-					"storage": resource.MustParse("10Mi"),
+					"storage": resource.MustParse("1Gi"),
 				},
 			},
 			VolumeMode: &fsMode,
@@ -339,7 +400,11 @@ func GenerateBuildWebhookRoute(component appstudiov1alpha1.Component) routev1.Ro
 // which defines how a webhook-based trigger event would be handled -
 // In this case, a PipelineRun to build an image would be created.
 func GenerateTriggerTemplate(component appstudiov1alpha1.Component, gitopsConfig prepare.GitopsConfig) (*triggersapi.TriggerTemplate, error) {
-	webhookBasedBuildTemplate := DetermineBuildExecution(component, getParamsForComponentBuild(component, false), "$(tt.params.git-revision)", gitopsConfig)
+	params, err := getParamsForComponentBuild(component, false)
+	if err != nil {
+		return nil, err
+	}
+	webhookBasedBuildTemplate := DetermineBuildExecution(component, params, "$(tt.params.git-revision)", gitopsConfig)
 	resoureTemplatePipelineRun := tektonapi.PipelineRun{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: component.Name + "-",
@@ -415,4 +480,23 @@ func GenerateEventListener(component appstudiov1alpha1.Component, triggerTemplat
 		},
 	}
 	return eventListener
+}
+
+// The GeneratePACRepository generates Repository for Pipelines-as-Code
+func GeneratePACRepository(component appstudiov1alpha1.Component) pacv1aplha1.Repository {
+	repository := pacv1aplha1.Repository{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Repository",
+			APIVersion: "pipelinesascode.tekton.dev/v1alpha1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        component.Name,
+			Namespace:   component.Namespace,
+			Annotations: getBuildCommonLabelsForComponent(&component),
+		},
+		Spec: pacv1aplha1.RepositorySpec{
+			URL: component.Spec.Source.GitSource.URL,
+		},
+	}
+	return repository
 }

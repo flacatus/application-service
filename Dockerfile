@@ -21,8 +21,8 @@ COPY gitops gitops/
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go
 
 
-FROM registry.access.redhat.com/ubi8/ubi-minimal:8.4-210
-RUN microdnf update -y && microdnf install git
+FROM registry.access.redhat.com/ubi8/ubi-minimal:8.6-751
+RUN microdnf update --setopt=install_weak_deps=0 -y && microdnf install git
 
 ARG ENABLE_WEBHOOKS=true
 ENV ENABLE_WEBHOOKS=${ENABLE_WEBHOOKS}
